@@ -278,11 +278,25 @@ try:
     req = urllib.request.Request("https://api.github.com/repos/%s/releases?per_page=10" % sys.argv[1],
                                  headers={"Accept": "application/vnd.github+json", "User-Agent": "k2-openklipper"})
     rel = [r for r in json.load(urllib.request.urlopen(req, timeout=30)) if not r.get("draft")]
-    print(rel[0]["tag_name"] if rel else "main")
+    print(rel[0]["tag_name"] if rel else "")
 except Exception:
-    print("main")
+    print("")
 PY
 )
+    # No answer from GitHub (no network, rate limit) or no release: never
+    # fall back to main, which is untested. An unpacked copy of the
+    # repository installs itself without asking GitHub.
+    if [ -z "$REF" ]; then
+        HERE0=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+        if [ "$MODE" = install ] && [ "$HERE0" != "$BUILD" ]                 && [ -f "$HERE0/klippy/klippy.py" ]; then
+            REF=$(cat "$HERE0/VERSION" 2>/dev/null || echo local)
+        elif [ "$MODE" = check ]; then
+            echo "    WARNING: could not ask GitHub for the newest release (network?)"
+            REF=unknown
+        else
+            die "could not find the newest release on GitHub (network or rate limit?). Try again later, or set OKL_REF=<tag>"
+        fi
+    fi
 fi
 echo "    version to install: $REF"
 if [ "$MODE" = update ] && [ -z "${OKL_REF:-}" ]; then

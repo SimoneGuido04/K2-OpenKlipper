@@ -17,9 +17,13 @@
 # Copyright (C) 2026  Hark Tech
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import json, logging, os, subprocess, threading, urllib.request
+import json, logging, os, re, subprocess, threading, urllib.request
 
 UPDATE_LOG = "/tmp/okl-update.log"
+# What a release tag and the repo may look like. Both go into a shell
+# command run as root, and git allows ; $ ( ) | in tag names.
+TAG_RE = re.compile(r"v?\d+\.\d+\.\d+(-[a-z]+\.\d+)?")
+REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
 
 class HarkUpdate:
@@ -28,6 +32,9 @@ class HarkUpdate:
         self.reactor = self.printer.get_reactor()
         self.gcode = self.printer.lookup_object('gcode')
         self.repo = config.get('repo', 'grant0013/K2-OpenKlipper')
+        if not REPO_RE.fullmatch(self.repo):
+            raise config.error("hark_update: repo must be owner/name, not %r"
+                               % (self.repo,))
         here = os.path.dirname(os.path.realpath(__file__))
         self.build = config.get(
             'build_dir', os.path.dirname(os.path.dirname(here)))
@@ -83,7 +90,10 @@ class HarkUpdate:
                     'User-Agent': 'k2-openklipper'})
             rels = [r for r in json.load(urllib.request.urlopen(req, timeout=30))
                     if not r.get('draft')]
-            if rels:
+            if rels and not TAG_RE.fullmatch(rels[0].get('tag_name') or ''):
+                result['error'] = ('newest release tag %r is not a version'
+                                   % (rels[0].get('tag_name'),))[:120]
+            elif rels:
                 rel = rels[0]
                 result.update({
                     'latest': rel.get('tag_name', ''),
@@ -196,6 +206,8 @@ class HarkUpdate:
             raise gcmd.error("No release known yet: run OKL_UPDATE_CHECK first")
         if not self.status.get('update_available'):
             raise gcmd.error("Already on %s" % self.status['installed'])
+        if not TAG_RE.fullmatch(tag):
+            raise gcmd.error("Release tag %r is not a version" % (tag,))
         self.gcode.respond_raw("// action:prompt_end")
         # The installer stops this Klipper, so it runs in its own session.
         # It is the release's own install.sh, fetched for that tag.

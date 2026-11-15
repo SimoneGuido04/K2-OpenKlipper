@@ -53,6 +53,37 @@ class HighTempPidTest(unittest.TestCase):
         self.assertAlmostEqual(heater.pwm[0] / heater2.pwm[0],
                                (16.5 + 1.36) / (32.827 + 3.367), places=2)
 
+    def test_high_set_integral_never_passes_full_power(self):
+        # A long way under a high target: the integral saturates. Its limit
+        # must follow the high-temp Ki, or Ki_high * integral exceeds full
+        # power and the heater overshoots while it unwinds
+        pid, heater = make()
+        t = 0.
+        pid.prev_temp_time, pid.prev_temp = t, 200.
+        for _ in range(500):
+            t += 1.
+            pid.temperature_update(t, 200., 300.)
+        ki_high = pid.high_gains[1]
+        self.assertLessEqual(ki_high * pid.prev_temp_integ, 1. + 1e-9)
+
+    def test_switching_sets_is_bumpless(self):
+        # Settled just under high_temp_value on the base set, then the
+        # target crosses it: the integral term (steady power) carries over
+        pid, heater = make()
+        t = 0.
+        pid.prev_temp_time, pid.prev_temp = t, 279.
+        for _ in range(100):
+            t += 1.
+            pid.temperature_update(t, 279., 280.)
+        steady = pid.Ki * pid.prev_temp_integ
+        self.assertLess(steady, 1.)
+        pid.prev_temp, pid.prev_temp_deriv = 281., 0.
+        t += 1.
+        pid.temperature_update(t, 281., 281.)    # no error, no derivative
+        self.assertAlmostEqual(heater.pwm[-1], steady, places=6)
+        self.assertAlmostEqual(pid.high_gains[1] * pid.prev_temp_integ,
+                               steady, places=6)
+
     def test_without_the_high_set_nothing_changes(self):
         pid, heater = make(high=False)
         self.assertIsNone(pid.high_gains)

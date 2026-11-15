@@ -36,8 +36,13 @@ watching, so the WHEP form, which the test page uses, refuses such an offer
   DELETE /whep/<id>    200
   /                    a test page that plays the stream
 Every viewer is its own session in webrtc_local and the work multiplies, so
-max_streams viewers at most; one over that is told no, not given the oldest
-one's place (closing a viewer's WebSocket would not end its session).
+max_streams viewers at most, WebSocket and WHEP together; one over that is
+told no, not given the oldest one's place (closing a viewer's WebSocket would
+not end its session). A WHEP session holds its place until DELETE, or for
+WHEP_TTL seconds when the browser never sends one.
+Request bodies and WebSocket frames are capped (MAX_BODY, MAX_WS_FRAME): an
+SDP offer is a few KB, and an unbounded read could take the memory Klipper
+needs on the printer's board.
 webrtc_local only sends video, so other media in the offer (Mainsail asks
 for audio too) are left out of what it sees and refused in the answer. The
 camera does only one format at a time: no MJPEG snapshots in this mode.
@@ -273,6 +278,10 @@ pc.createOffer().then(o => pc.setLocalDescription(o)).then(() =>
                  headers: {"Content-Type": "application/sdp"},
                  body: pc.localDescription.sdp}))
   .then(r => { if (r.status !== 201) throw new Error("status " + r.status);
+               const loc = r.headers.get("Location");
+               // give the viewer place back when the page closes
+               if (loc) addEventListener("pagehide", () =>
+                 fetch(loc, {method: "DELETE", keepalive: true}));
                return r.text(); })
   .then(sdp => pc.setRemoteDescription({type: "answer", sdp}))
   .catch(e => { s.textContent = "failed: " + e; });
@@ -452,9 +461,31 @@ CAM = PACER = STREAMS = None
 
 MODE, WEBRTC_URL = "mjpeg", DEFAULTS["webrtc_url"]
 WS_GATHER, WS_GATHER_MAX = 0.6, 3.0
-SESSIONS = {}           # WHEP session id -> start time (for the log)
+SESSIONS = {}           # WHEP session id -> (start time, its Viewers)
+SESSIONS_LOCK = threading.Lock()
+WHEP_TTL = 300.0        # a WHEP session never DELETEd frees its place then
 VIEWERS = Viewers(int(DEFAULTS["max_streams"]))
 VIEWER_WAIT = 3.0       # seconds a new WebRTC viewer waits for a place
+MAX_BODY = 64 << 10     # largest request body read (an SDP offer is a few KB)
+MAX_WS_FRAME = 64 << 10  # largest WebSocket frame read
+
+
+def whep_end(sid):
+    """End a WHEP session: its viewer place is free again."""
+    with SESSIONS_LOCK:
+        entry = SESSIONS.pop(sid, None)
+    if entry is not None:
+        entry[1].leave()
+
+
+def whep_reap(now=None):
+    """Free the places of WHEP sessions never DELETEd within WHEP_TTL."""
+    now = time.time() if now is None else now
+    with SESSIONS_LOCK:
+        old = [sid for sid, (start, _) in SESSIONS.items()
+               if now - start > WHEP_TTL]
+    for sid in old:
+        whep_end(sid)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -473,6 +504,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 break
             buf += chunk
         return buf
+
+    def read_body(self):
+        """The request body, or None (a 4xx sent) when its length is
+        missing, invalid or over MAX_BODY."""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if n < 0:
+            self.plain(400, "bad Content-Length")
+            return None
+        if n > MAX_BODY:
+            self.close_connection = True
+            self.plain(413, "request body over %d bytes" % MAX_BODY)
+            return None
+        return self.read_exact(n)
 
     def cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -517,12 +564,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return None
             op, n = head[0] & 0x0F, head[1] & 0x7F
             if n == 126:
-                n = struct.unpack(">H", self.read_exact(2))[0]
+                ext = self.read_exact(2)
+                if len(ext) < 2:
+                    return None
+                n = struct.unpack(">H", ext)[0]
             elif n == 127:
-                n = struct.unpack(">Q", self.read_exact(8))[0]
+                ext = self.read_exact(8)
+                if len(ext) < 8:
+                    return None
+                n = struct.unpack(">Q", ext)[0]
+            # Over the cap, or a control frame over 125 bytes (RFC 6455
+            # 5.5): close instead of reading it into memory
+            if n > MAX_WS_FRAME or (op >= 8 and n > 125):
+                return None
             mask = self.read_exact(4) if head[1] & 0x80 else b"\0\0\0\0"
-            data = bytes(b ^ mask[i % 4] for i, b in
-                         enumerate(self.read_exact(n)))
+            if len(mask) < 4:
+                return None
+            raw = self.read_exact(n)
+            if len(raw) < n:
+                return None
+            data = bytes(b ^ mask[i % 4] for i, b in enumerate(raw))
             if op == 8:
                 return None
             if op == 9:                       # ping -> pong
@@ -567,12 +628,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 cands.append(m["value"])
         if not offer:
             return
-        if not VIEWERS.enter(VIEWER_WAIT):
-            print("ws: %s refused, %d viewers already" % (ip, VIEWERS.cap),
+        viewers = VIEWERS     # the one entered is the one left
+        if not viewers.enter(VIEWER_WAIT):
+            print("ws: %s refused, %d viewers already" % (ip, viewers.cap),
                   flush=True)
             self.ws_send({"type": "error", "value":
                           "camera: %d viewers already (max_streams in "
-                          "harkcam.cfg)" % VIEWERS.cap})
+                          "harkcam.cfg)" % viewers.cap})
             return
         try:
             try:
@@ -592,7 +654,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             while self.ws_recv() is not None:
                 pass
         finally:
-            VIEWERS.leave()
+            viewers.leave()
 
     def whep(self):
         """The path is /whep or /whep/<id> (behind nginx's /webcam/)."""
@@ -616,24 +678,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if MODE != "webrtc":
             return self.plain(409, "harkcam is in mode: mjpeg; set mode: "
                               "webrtc in harkcam.cfg for WebRTC")
-        offer = self.read_exact(int(self.headers.get("Content-Length") or 0))
+        offer = self.read_body()
+        if offer is None:
+            return
         if b"a=candidate" not in offer:
             return self.plain(400, "no ICE candidates in the offer: set the "
                               "camera type to WebRTC (go2rtc)")
+        whep_reap()
+        viewers = VIEWERS
+        if not viewers.enter(VIEWER_WAIT):
+            print("whep: %s refused, %d viewers already"
+                  % (self.client_ip(), viewers.cap), flush=True)
+            return self.plain(503, "camera: %d viewers already (max_streams "
+                              "in harkcam.cfg)" % viewers.cap)
         try:
             sdp, plan = offer_for_creality(offer.decode(),
                                            client_ip=self.client_ip())
             answer = answer_for_browser(
                 call_creality(WEBRTC_URL, sdp), plan)
         except Exception as e:
+            viewers.leave()
             print("whep: %s" % e, flush=True)
             return self.plain(502, "webrtc_local: %s" % e)
         sid = uuid.uuid4().hex
-        SESSIONS[sid] = time.time()
-        while len(SESSIONS) > 32:
-            SESSIONS.pop(next(iter(SESSIONS)))
-        print("whep: session %s (%d kept)" % (sid[:8], len(SESSIONS)),
-              flush=True)
+        with SESSIONS_LOCK:
+            SESSIONS[sid] = (time.time(), viewers)
+            kept = len(SESSIONS)
+        print("whep: session %s (%d kept)" % (sid[:8], kept), flush=True)
         body = answer.encode()
         self.send_response(201)
         self.send_header("Content-Type", "application/sdp")
@@ -647,7 +718,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_PATCH(self):
         if not self.whep():
             return self.plain(404, "not found")
-        self.read_exact(int(self.headers.get("Content-Length") or 0))
+        if self.read_body() is None:
+            return
         self.send_response(204)
         self.cors()
         self.end_headers()
@@ -656,7 +728,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sid = self.whep()
         if not sid:
             return self.plain(404, "not found")
-        SESSIONS.pop(sid, None)
+        whep_end(sid)
         self.send_response(200)
         self.cors()
         self.send_header("Content-Length", "0")

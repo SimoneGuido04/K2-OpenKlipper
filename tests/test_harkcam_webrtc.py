@@ -11,6 +11,7 @@ import importlib.util
 import json
 import pathlib
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -354,6 +355,62 @@ class WhepTest(unittest.TestCase):
             self.assertTrue(hc.VIEWERS.enter(1.0))
         finally:
             hc.VIEWERS = saved
+
+    def test_whep_counts_against_the_viewer_cap(self):
+        saved = hc.VIEWERS, hc.VIEWER_WAIT
+        hc.VIEWERS, hc.VIEWER_WAIT = hc.Viewers(1), 0.2
+        try:
+            code, h, _ = self.req("POST", "/whep", GATHERED)
+            self.assertEqual(code, 201)
+            FakeWebrtcLocal.offers.clear()
+            code, _, body = self.req("POST", "/whep", GATHERED)
+            self.assertEqual(code, 503)
+            self.assertIn("1 viewers", body)
+            self.assertEqual(FakeWebrtcLocal.offers, [])
+            # DELETE gives the place back
+            sid = h["Location"].split("/")[-1]
+            self.assertEqual(self.req("DELETE", "/whep/" + sid)[0], 200)
+            self.assertEqual(self.req("POST", "/whep", GATHERED)[0], 201)
+        finally:
+            with hc.SESSIONS_LOCK:
+                hc.SESSIONS.clear()
+            hc.VIEWERS, hc.VIEWER_WAIT = saved
+
+    def test_a_failed_whep_call_gives_the_place_back(self):
+        saved = hc.VIEWERS
+        hc.VIEWERS = hc.Viewers(1)
+        FakeWebrtcLocal.reply = {"type": "error"}
+        try:
+            self.assertEqual(self.req("POST", "/whep", GATHERED)[0], 502)
+            self.assertTrue(hc.VIEWERS.enter(1.0))
+        finally:
+            hc.VIEWERS = saved
+
+    def test_whep_session_never_deleted_expires(self):
+        viewers = hc.Viewers(1)
+        self.assertTrue(viewers.enter(0))
+        with hc.SESSIONS_LOCK:
+            hc.SESSIONS["old"] = (time.time() - hc.WHEP_TTL - 1, viewers)
+        hc.whep_reap()
+        self.assertNotIn("old", hc.SESSIONS)
+        self.assertTrue(viewers.enter(0))
+
+    def test_oversized_body_is_refused(self):
+        code, _, _ = self.req("POST", "/whep",
+                              "a=candidate:" + "x" * (hc.MAX_BODY + 1))
+        self.assertEqual(code, 413)
+        self.assertEqual(FakeWebrtcLocal.offers, [])
+
+    def test_oversized_websocket_frame_closes(self):
+        _, sock = self.ws([], wait_answer=False, keep=True)
+        # A 64-bit length far over the cap: the server must close, not read
+        sock.sendall(bytes([0x81, 0x80 | 127])
+                     + struct.pack(">Q", 1 << 40) + os.urandom(4))
+        sock.settimeout(8)
+        try:
+            self.assertEqual(sock.recv(1), b"")
+        finally:
+            sock.close()
 
     def test_whep_refused_in_mjpeg_mode(self):
         hc.MODE = "mjpeg"

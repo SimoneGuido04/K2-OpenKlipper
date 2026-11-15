@@ -114,10 +114,13 @@ class HarkPIDProfiles:
                 new.prev_temp = old.prev_temp
                 new.prev_temp_time = old.prev_temp_time
                 new.prev_temp_deriv = old.prev_temp_deriv
+                # The integral is in the scale of the Ki the old loop used
+                # last (its high-temp set, above high_temp_value)
+                old_ki = getattr(old, 'active_Ki', old.Ki)
                 if new.Ki:
                     new.prev_temp_integ = max(0., min(
                         new.temp_integ_max,
-                        old.prev_temp_integ * old.Ki / new.Ki))
+                        old.prev_temp_integ * old_ki / new.Ki))
             heater.control = new
         self.active[heater_name] = profile
         logging.info("PID_PROFILE: %s now '%s' Kp=%.3f Ki=%.3f Kd=%.3f",

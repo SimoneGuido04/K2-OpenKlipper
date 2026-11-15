@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+Fixes from the 2026-11-15 audit (findings 3.1 to 3.6). Tested offline only
+(unit tests); not yet run on a printer.
+
+- **Tests run on every push and pull request** (`.github/workflows/tests.yml`,
+  Python 3.9 and 3.12), plus a byte-compile of all the Python.
+- **Camera: request size caps.** WebSocket frames and request bodies over
+  64 KB close the connection or get a 413, instead of being read into memory
+  that Klipper needs. Control frames over 125 bytes close the socket (RFC 6455).
+- **Camera: WHEP viewers count against `max_streams`**, like WebSocket
+  viewers. A WHEP session holds its place until DELETE, or for 5 minutes. The
+  test page sends DELETE when it closes. A viewer always gives its place back
+  to the same counter it took it from.
+- **High-temperature PID gains** (`pid_*_high_temp`, off by default): each gain
+  set has its own integral limit, so a larger high-temperature Ki can no longer
+  wind up past full power. Crossing `high_temp_value` rescales the integral, so
+  the heater output does not jump. `PID_PROFILE` carries the integral over in
+  the scale of the gain set that was in use.
+- **Updates: the release tag and repo are validated** before they go into the
+  root shell command (`hark_update`). A malformed tag is never offered or
+  installed.
+- **The installer no longer falls back to the untested `main`** when GitHub
+  does not answer. It stops and says to retry or set `OKL_REF`. `--check` only
+  warns, and an unpacked copy of the repository still installs offline.
+
 ## v0.4.25-alpha.1 (2026-11-09)
 
 Fixes from a code review of v0.4.24-alpha.1. RELEASE-NOTES-v0.4.25-alpha.1.md

@@ -214,7 +214,29 @@ class ControlPID:
         self.prev_temp_time = 0.
         self.prev_temp_deriv = 0.
         self.prev_temp_integ = 0.
+        # Ki of the gain set used last: prev_temp_integ is in its scale
+        self.active_Ki = self.Ki
+    def _gains(self, target_temp):
+        """(Kp, Ki, Kd, integral limit) for this target. Switching sets
+        rescales the integral so Ki * integral, the steady heater power,
+        carries over (no output jump at high_temp_value), and each set
+        has its own limit, so a larger high-temp Ki cannot wind up past
+        full power."""
+        if self.high_gains is not None and target_temp > self.high_temp_value:
+            kp, ki, kd = self.high_gains
+            integ_max = self.heater_max_power / ki if ki else 0.
+        else:
+            kp, ki, kd = self.Kp, self.Ki, self.Kd
+            integ_max = self.temp_integ_max
+        if ki != self.active_Ki:
+            if ki and self.active_Ki:
+                self.prev_temp_integ *= self.active_Ki / ki
+            else:
+                self.prev_temp_integ = 0.
+            self.active_Ki = ki
+        return kp, ki, kd, integ_max
     def temperature_update(self, read_time, temp, target_temp):
+        kp, ki, kd, integ_max = self._gains(target_temp)
         time_diff = read_time - self.prev_temp_time
         # Calculate change of temperature
         temp_diff = temp - self.prev_temp
@@ -226,11 +248,8 @@ class ControlPID:
         # Calculate accumulated temperature "error"
         temp_err = target_temp - temp
         temp_integ = self.prev_temp_integ + temp_err * time_diff
-        temp_integ = max(0., min(self.temp_integ_max, temp_integ))
+        temp_integ = max(0., min(integ_max, temp_integ))
         # Calculate output
-        kp, ki, kd = self.Kp, self.Ki, self.Kd
-        if self.high_gains is not None and target_temp > self.high_temp_value:
-            kp, ki, kd = self.high_gains
         co = kp*temp_err + ki*temp_integ - kd*temp_deriv
         #logging.debug("pid: %f@%.3f -> diff=%f deriv=%f err=%f integ=%f co=%d",
         #    temp, read_time, temp_diff, temp_deriv, temp_err, temp_integ, co)
