@@ -16,7 +16,9 @@
 # Combo (F021) or the K2 Plus (F008; docs/K2-PLUS-BETA.md is its first-run
 # guide), at your own risk, OKL_EXTRUDER=stock|dxc2 to answer the
 # extruder question in advance, OKL_CFS=yes|no to fix whether a CFS is used
-# (default: found automatically at each start).
+# (default: found automatically at each start), OKL_KEEP_BACKUPS=<n> backups
+# kept in full (default 3; the first one, Creality's originals, is always
+# kept).
 set -eu
 
 REPO=grant0013/K2-OpenKlipper
@@ -37,6 +39,54 @@ esac
 
 say() { echo "==> $*"; }
 die() { echo "STOPPED: $*" >&2; exit 1; }
+
+# The new version is copied next to the installed one first (*.okl-new) and
+# only then swapped in. If anything fails after the swap, the previous
+# version goes back in place, so a failed update never leaves the printer
+# without its open stack. System files are not rolled back: the backup holds
+# Creality's originals, not the previous version's (uninstall.sh uses them).
+STAGE_DIRS="mainsail-mainline harkscreen harkcam"
+SWAPPED=0
+DONE=0
+rollback() {
+    [ "$DONE" = 1 ] && return 0
+    if [ "$SWAPPED" = 1 ] && [ -e "$BACKUP/build.previous" ]; then
+        echo "STOPPED part way: putting the previous version back" >&2
+        rm -rf "$BUILD" && mv "$BACKUP/build.previous" "$BUILD" || true
+        for d in $STAGE_DIRS; do
+            if [ -e "$BACKUP/$d.previous" ]; then
+                rm -rf "/mnt/UDISK/$d" && mv "$BACKUP/$d.previous" "/mnt/UDISK/$d" || true
+            fi
+        done
+        echo "    previous version restored in $BUILD; reboot the printer" >&2
+    fi
+    rm -rf "$BUILD.okl-new" 2>/dev/null || true
+    for d in $STAGE_DIRS; do rm -rf "/mnt/UDISK/$d.okl-new" 2>/dev/null || true; done
+}
+trap rollback EXIT
+# A dropped SSH session or Ctrl-C still runs the rollback
+trap 'exit 1' HUP INT TERM
+
+# Keep the newest OKL_KEEP_BACKUPS backups in full. Older ones go, except the
+# first, which keeps Creality's original files (its copies of old builds,
+# *.previous, go). Each update otherwise added 35-40 MB to /mnt/UDISK.
+prune_backups() {
+    keep=${OKL_KEEP_BACKUPS:-3}
+    case "$keep" in ''|*[!0-9]*|0) keep=3 ;; esac
+    all=$(ls -d /mnt/UDISK/openklipper-backups/2[0-9][0-9][0-9][0-1][0-9][0-3][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9] 2>/dev/null | sort)
+    n=$(printf '%s\n' "$all" | grep -c . || true)
+    [ "$n" -gt "$keep" ] || return 0
+    first=$(printf '%s\n' "$all" | head -1)
+    printf '%s\n' "$all" | head -n $((n - keep)) | while read -r d; do
+        [ "$d" = "$BACKUP" ] && continue
+        if [ "$d" = "$first" ]; then
+            rm -rf "$d"/*.previous
+        else
+            rm -rf "$d"
+        fi
+    done
+    echo "    old backups removed: kept the first and the newest $keep"
+}
 
 # Remove master-server, upgrade-server and Monitor from APP_LIST in Creality's
 # /etc/init.d/app (in place; the original is backed up). --check only tests
@@ -356,6 +406,32 @@ PY
     [ -n "$SRC" ] && [ -f "$SRC/klippy/klippy.py" ] || die "download did not unpack as expected"
 fi
 NEW_VERSION=$(cat "$SRC/VERSION" 2>/dev/null || echo "$REF")
+# A downloaded release must be the version its tag names
+if [ "$SRC" != "$HERE" ]; then
+    case "$REF" in
+        v[0-9]*|[0-9]*)
+            [ "$NEW_VERSION" = "${REF#v}" ] \
+                || die "download of $REF says it is version $NEW_VERSION; nothing was changed" ;;
+    esac
+fi
+
+# ---------------------------------------------------------------- stage
+say "Preparing $NEW_VERSION next to the installed version"
+STAGE=$BUILD.okl-new
+rm -rf "$STAGE"
+for d in $STAGE_DIRS; do rm -rf "/mnt/UDISK/$d.okl-new"; done
+cp -a "$SRC" "$STAGE"
+echo "$NEW_VERSION" > "$STAGE/VERSION"
+cp -a "$STAGE/system/mainsail" /mnt/UDISK/mainsail-mainline.okl-new
+cp -a "$STAGE/harkscreen" /mnt/UDISK/harkscreen.okl-new
+cp -a "$STAGE/harkcam" /mnt/UDISK/harkcam.okl-new
+for f in klippy/klippy.py "config/$STAGE_CFG" config/printer-overrides.cfg.example \
+        switch-to-mainline.sh switch-to-stock.sh uninstall.sh system-nginx.conf \
+        system/moonraker-mainline.init system/moonraker-compat/update_manager.py \
+        harkscreen/start.sh harkcam/start.sh; do
+    [ -s "$STAGE/$f" ] || die "the new version is incomplete ($f is missing); nothing was changed"
+done
+python3 -m py_compile "$STAGE/system/moonraker-compat/update_manager.py"
 
 # ---------------------------------------------------------------- backup
 say "Backing up to $BACKUP"
@@ -380,19 +456,23 @@ if [ "$APPINIT" = already ] && [ -n "$PREV" ] && [ -f "$PREV/app.init" ]; then
     done
 fi
 [ -d "$CONF" ] && cp -a "$CONF" "$BACKUP/printer_data_mainline-config"
-[ -e "$BUILD" ] && mv "$BUILD" "$BACKUP/build.previous"
-for d in mainsail-mainline harkscreen harkcam; do
-    [ -e "/mnt/UDISK/$d" ] && mv "/mnt/UDISK/$d" "$BACKUP/$d.previous"
-done
 echo "$BACKUP" > /mnt/UDISK/openklipper-backups/LATEST
 
-# ---------------------------------------------------------------- files
+# ---------------------------------------------------------------- swap
+# Renames on the same file system: from here a failure restores the
+# previous version (rollback above)
 say "Installing K2 OpenKlipper $NEW_VERSION to $BUILD"
-cp -a "$SRC" "$BUILD"
-echo "$NEW_VERSION" > "$BUILD/VERSION"
+SWAPPED=1
+if [ -e "$BUILD" ]; then mv "$BUILD" "$BACKUP/build.previous"; fi
+mv "$STAGE" "$BUILD"
+for d in $STAGE_DIRS; do
+    if [ -e "/mnt/UDISK/$d" ]; then mv "/mnt/UDISK/$d" "$BACKUP/$d.previous"; fi
+    mv "/mnt/UDISK/$d.okl-new" "/mnt/UDISK/$d"
+done
+
+# ---------------------------------------------------------------- files
 chmod 755 "$BUILD/switch-to-mainline.sh" "$BUILD/switch-to-stock.sh" "$BUILD/install.sh" "$BUILD/creality-update.sh" \
     "$BUILD/system/moonraker-mainline.init" "$BUILD/uninstall.sh" 2>/dev/null || true
-python3 -m py_compile "$BUILD/system/moonraker-compat/update_manager.py"
 
 mkdir -p "$CONF" "$PDATA/logs" "$FLAGS"
 # Share the stock G-code library. This must exist before Moonraker first
@@ -401,7 +481,6 @@ if [ -d "$PDATA/gcodes" ] && [ ! -L "$PDATA/gcodes" ] && [ -z "$(ls -A "$PDATA/g
     rmdir "$PDATA/gcodes"
 fi
 [ -e "$PDATA/gcodes" ] || ln -s /mnt/UDISK/printer_data/gcodes "$PDATA/gcodes"
-cp -a "$BUILD/system/mainsail" /mnt/UDISK/mainsail-mainline
 [ -f "$CONF/moonraker.conf" ] || cp "$BUILD/system/moonraker-mainline.conf" "$CONF/moonraker.conf"
 # Older installs pointed [update_manager mainsail] at stock Mainsail: one
 # Update click replaced the Hark build. Point it at the Hark releases.
@@ -515,7 +594,6 @@ case "$SETTINGS" in
 esac
 
 # Touchscreen and camera
-cp -a "$BUILD/harkscreen" /mnt/UDISK/harkscreen
 # The screen's own version (a host-driven K2 brings its screen in step with it)
 cp "$BUILD/VERSION" /mnt/UDISK/harkscreen/VERSION
 # Default look: Klipper logo and colours. An existing harkscreen.cfg (your own
@@ -531,7 +609,6 @@ if grep -q "^timezone: uk$" "$CONF/harkscreen.cfg" 2>/dev/null \
     sed -i 's/^timezone: uk$/timezone: auto/' "$CONF/harkscreen.cfg"
     echo "    harkscreen.cfg: clock follows the printer's time zone ($(uci -q get system.@system[0].zonename))"
 fi
-cp -a "$BUILD/harkcam" /mnt/UDISK/harkcam
 chmod 755 /mnt/UDISK/harkscreen/start.sh /mnt/UDISK/harkcam/start.sh
 # Camera settings (size, frame rate, viewer cap), editable in Mainsail. An
 # existing harkcam.cfg is kept.
@@ -592,6 +669,10 @@ fi
 sed -i "/boot-mainline/s/mainline_stage2[a-z0-9_]*\.cfg/$STAGE_CFG/" /etc/rc.local
 rm -f "$FLAGS/boot-mainline.off"
 touch "$FLAGS/boot-mainline"
+
+# Every file is in place: from here nothing is rolled back
+DONE=1
+prune_backups || true
 
 # ---------------------------------------------------------------- start
 say "Starting"

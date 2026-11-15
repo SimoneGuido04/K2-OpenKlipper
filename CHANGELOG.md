@@ -2,9 +2,19 @@
 
 ## Unreleased
 
-Fixes from the 2026-11-15 audit (findings 3.1 to 3.6). Tested offline only
+Fixes from the 2026-11-15 audit (findings 3.1 to 3.8). Tested offline only
 (unit tests); not yet run on a printer.
 
+- **A failed update no longer leaves the printer without its open stack.**
+  The installer first copies the new version next to the installed one
+  (`*.okl-new`) and checks it is complete. It then swaps it in by renaming.
+  If a later step fails, or the SSH session drops, the previous build, the
+  touchscreen, the camera and Mainsail go back in place. A downloaded release
+  must also carry the version its tag names.
+- **Backups no longer fill /mnt/UDISK.** After each install only the newest
+  three backups are kept in full (`OKL_KEEP_BACKUPS`). The first one, which
+  holds Creality's originals, is always kept, without its copies of old
+  builds. Each update used to add 35-40 MB.
 - **Tests run on every push and pull request** (`.github/workflows/tests.yml`,
   Python 3.9 and 3.12), plus a byte-compile of all the Python.
 - **Camera: request size caps.** WebSocket frames and request bodies over

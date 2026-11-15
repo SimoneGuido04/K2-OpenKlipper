@@ -331,8 +331,13 @@ restores your settings.
 | `/etc/nginx/nginx.conf` | Adds Mainsail on port 4409; Creality's Fluidd page on 4408 now talks to the open stack too. No access logs (they live in RAM) |
 | Moonraker | A second instance on port 7126; the stock one on 7125 is switched off |
 
-All of these are backed up in `/mnt/UDISK/openklipper-backups/` first. Nothing
-is flashed: the printer's control boards keep Creality's firmware, and motor
+All of these are backed up in `/mnt/UDISK/openklipper-backups/` first. Each
+install or update makes a new backup there. The newest three are kept in
+full (`OKL_KEEP_BACKUPS=<n>` changes that). The first one is always kept,
+because it holds Creality's original files, but its copies of old builds go.
+An update copies the new version next to the installed one before switching
+over; if a step fails after the switch, the previous version is put back.
+Nothing is flashed: the printer's control boards keep Creality's firmware, and motor
 settings are only ever written to RAM, so a power cycle restores them.
 
 ## Troubleshooting
